@@ -11,11 +11,12 @@ from google.oauth2.service_account import Credentials
 # ----------------------------
 # Config
 # ----------------------------
-PART_CODES_CSV = Path("part_codes.csv")  # must contain column: part_code
-LOCATIONS_SHEET_TAB = "locations"        # Google Sheet tab name
+PART_CODES_CSV = Path("part_codes.csv")     # must contain column: part_code
+LOCATIONS_SHEET_TAB = "locations"           # Google Sheet tab name
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-REQUIRED_FIELDS_NOTE = "Row, Rack, and Shelf are required. Bin is optional."
+# New optional field
+OPTIONAL_NOTE = "Row, Rack, and Shelf are required. Bin and Additional Location are optional."
 
 # ----------------------------
 # Google Sheets helpers
@@ -35,7 +36,17 @@ def get_locations_ws():
 
 
 def ensure_locations_header(ws):
-    desired = ["part_code", "row", "rack", "shelf", "bin", "updated_at", "updated_by"]
+    # Updated header to include additional_location (A:H)
+    desired = [
+        "part_code",
+        "row",
+        "rack",
+        "shelf",
+        "bin",
+        "additional_location",
+        "updated_at",
+        "updated_by",
+    ]
     header = ws.row_values(1)
     if header != desired:
         ws.clear()
@@ -53,7 +64,7 @@ def load_locations_index():
 
     col = ws.col_values(1)  # includes header
     idx = {}
-    for i, code in enumerate(col[1:], start=2):  # rows start at 1; row 1 is header
+    for i, code in enumerate(col[1:], start=2):  # row 1 is header
         code = (code or "").strip()
         if code:
             idx[code] = i
@@ -70,15 +81,16 @@ def fetch_location_from_sheet(part_code: str):
         return None
 
     row = ws.row_values(rownum)
-    row += [""] * (7 - len(row))  # pad to A:G
+    row += [""] * (8 - len(row))  # pad to A:H
     return {
         "part_code": row[0],
         "row": row[1],
         "rack": row[2],
         "shelf": row[3],
         "bin": row[4],
-        "updated_at": row[5],
-        "updated_by": row[6],
+        "additional_location": row[5],
+        "updated_at": row[6],
+        "updated_by": row[7],
     }
 
 
@@ -88,6 +100,7 @@ def upsert_location_to_sheet(
     rack: str,
     shelf: str,
     bin_val: str | None,
+    additional_location: str | None,
     updated_by: str = "",
 ):
     ws = get_locations_ws()
@@ -102,17 +115,18 @@ def upsert_location_to_sheet(
         rack,
         shelf,
         bin_val or "",
+        additional_location or "",
         now,
         updated_by or "",
     ]
 
     rownum = idx.get(part_code)
     if rownum:
-        ws.update(f"A{rownum}:G{rownum}", [values])
+        # Update existing row A:H
+        ws.update(f"A{rownum}:H{rownum}", [values])
     else:
         ws.append_row(values)
 
-    # Clear cache so next read sees latest
     load_locations_index.clear()
 
 
@@ -130,14 +144,12 @@ def load_part_codes(csv_path: Path) -> pd.Series:
 
 
 def exact_match_in_series(codes: pd.Series, q: str) -> bool:
-    # Series membership test that works fine at 80k scale
     return (codes == q).any()
 
 
 def prefix_suggestions(codes: pd.Series, prefix: str, limit: int = 50) -> list[str]:
     if not prefix:
         return []
-    # Prefix search is fast and usually enough for barcodes
     matches = codes[codes.str.startswith(prefix, na=False)].head(limit)
     return matches.tolist()
 
@@ -147,9 +159,8 @@ def prefix_suggestions(codes: pd.Series, prefix: str, limit: int = 50) -> list[s
 # ----------------------------
 st.set_page_config(page_title="Inventory Location Mapper", layout="centered")
 st.title("Inventory Location Mapper (Google Sheets backend)")
-st.caption("Search/scan a part code → set Row/Rack/Shelf/Bin → saved to Google Sheets.")
+st.caption("Search/scan a part code → set Row/Rack/Shelf/Bin/Additional Location → saved to Google Sheets.")
 
-# Basic preflight checks
 if "GCP_SERVICE_ACCOUNT" not in st.secrets or "SHEET_ID" not in st.secrets:
     st.error(
         "Missing Streamlit Secrets.\n\n"
@@ -159,7 +170,7 @@ if "GCP_SERVICE_ACCOUNT" not in st.secrets or "SHEET_ID" not in st.secrets:
     )
     st.stop()
 
-# Ensure sheet header exists early (and fail fast if permissions are wrong)
+# Ensure sheet is accessible
 try:
     ws = get_locations_ws()
     ensure_locations_header(ws)
@@ -181,7 +192,6 @@ if not PART_CODES_CSV.exists():
 codes = load_part_codes(PART_CODES_CSV)
 st.caption(f"Loaded {len(codes):,} part codes from CSV.")
 
-# Optional "updated_by" field (lightweight)
 with st.expander("Optional: set your name (saved in updated_by)"):
     updated_by = st.text_input("Your name / initials", value=st.session_state.get("updated_by", ""))
     st.session_state["updated_by"] = updated_by.strip()
@@ -200,7 +210,6 @@ selected_part_code = None
 if query:
     q = query.strip()
 
-    # If part code exists in CSV: allow selection immediately
     if q and exact_match_in_series(codes, q):
         selected_part_code = q
         st.success("Exact match found in master list.")
@@ -220,13 +229,7 @@ if query:
 st.divider()
 
 if selected_part_code:
-    # Fetch existing mapping from Google Sheet (if any)
-    existing = None
-    try:
-        existing = fetch_location_from_sheet(selected_part_code)
-    except Exception as e:
-        st.error(f"Could not read from Google Sheet. Error: {e}")
-        st.stop()
+    existing = fetch_location_from_sheet(selected_part_code)
 
     if existing:
         st.info(f"Existing location found (updated_at: {existing.get('updated_at', '')}). You can edit and save.")
@@ -234,10 +237,11 @@ if selected_part_code:
         rack0 = existing.get("rack", "")
         shelf0 = existing.get("shelf", "")
         bin0 = existing.get("bin", "")
+        addloc0 = existing.get("additional_location", "")
     else:
-        row0 = rack0 = shelf0 = bin0 = ""
+        row0 = rack0 = shelf0 = bin0 = addloc0 = ""
 
-    st.caption(REQUIRED_FIELDS_NOTE)
+    st.caption(OPTIONAL_NOTE)
 
     with st.form("location_form", clear_on_submit=False):
         st.subheader(f"Set location for: {selected_part_code}")
@@ -246,6 +250,11 @@ if selected_part_code:
         rack = st.text_input("Rack *", value=rack0, placeholder="Required")
         shelf = st.text_input("Shelf *", value=shelf0, placeholder="Required")
         bin_val = st.text_input("Bin (optional)", value=bin0, placeholder="Optional")
+        additional_location = st.text_input(
+            "Additional location (optional)",
+            value=addloc0,
+            placeholder="e.g., Row B / Rack 2 / Shelf 3 / Bin 9",
+        )
 
         submitted = st.form_submit_button("Save")
 
@@ -262,19 +271,17 @@ if selected_part_code:
                 for e in errors:
                     st.error(e)
             else:
-                try:
-                    upsert_location_to_sheet(
-                        part_code=selected_part_code.strip(),
-                        row_loc=row_loc.strip(),
-                        rack=rack.strip(),
-                        shelf=shelf.strip(),
-                        bin_val=bin_val.strip() if bin_val.strip() else None,
-                        updated_by=updated_by,
-                    )
-                    st.success("Saved successfully ✅")
-                    st.toast("Saved", icon="✅")
-                except Exception as e:
-                    st.error(f"Could not write to Google Sheet. Error: {e}")
+                upsert_location_to_sheet(
+                    part_code=selected_part_code.strip(),
+                    row_loc=row_loc.strip(),
+                    rack=rack.strip(),
+                    shelf=shelf.strip(),
+                    bin_val=bin_val.strip() if bin_val.strip() else None,
+                    additional_location=additional_location.strip() if additional_location.strip() else None,
+                    updated_by=updated_by,
+                )
+                st.success("Saved successfully ✅")
+                st.toast("Saved", icon="✅")
 
     with st.expander("View current saved record (from Google Sheet)"):
         current = fetch_location_from_sheet(selected_part_code)
@@ -285,21 +292,17 @@ if selected_part_code:
 
 st.divider()
 
-# Download all mappings (reads entire sheet tab; okay for moderate size)
 if st.button("Download all saved mappings as CSV"):
-    try:
-        ws = get_locations_ws()
-        ensure_locations_header(ws)
-        values = ws.get_all_values()
-        if len(values) <= 1:
-            st.info("No mappings saved yet.")
-        else:
-            df = pd.DataFrame(values[1:], columns=values[0])
-            st.download_button(
-                "Click to download",
-                data=df.to_csv(index=False).encode("utf-8"),
-                file_name="inventory_locations.csv",
-                mime="text/csv",
-            )
-    except Exception as e:
-        st.error(f"Download failed. Error: {e}")
+    ws = get_locations_ws()
+    ensure_locations_header(ws)
+    values = ws.get_all_values()
+    if len(values) <= 1:
+        st.info("No mappings saved yet.")
+    else:
+        df = pd.DataFrame(values[1:], columns=values[0])
+        st.download_button(
+            "Click to download",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name="inventory_locations.csv",
+            mime="text/csv",
+        )
